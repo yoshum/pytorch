@@ -76,25 +76,30 @@ def _symeig_backward_partial_eigenspace(D_grad, U_grad, A, D, U):
     # of the characteristic polynomial.
     chr_poly_D = _polynomial_coefficients_given_roots(D)
 
-    res = _symeig_backward_complete_eigenspace(
-        D_grad, U_grad, A, D, U
-    )
-
     # compute chr_poly_D(U_ortho^T A U_ortho)^{-1})
     U_ortho_t = U_ortho.transpose(-2, -1).contiguous()
     U_ortho_t_A_U_ortho = torch.matmul(
         U_ortho_t,
         torch.matmul(A, U_ortho)
     )
-    q = U_ortho_t_A_U_ortho.new_zeros(U_ortho_t_A_U_ortho.shape)
+    chr_poly_val = U_ortho_t_A_U_ortho.new_zeros(U_ortho_t_A_U_ortho.shape)
+    U_ortho_t_A_U_ortho_power = U_ortho_t_A_U_ortho.matrix_power(0)
     for k in range(chr_poly_D.shape[-1]):
-        q += chr_poly_D[k] * U_ortho_t_A_U_ortho.matrix_power(k)
-    q = q.inverse()
+        chr_poly_val += chr_poly_D[k] * U_ortho_t_A_U_ortho_power
+        U_ortho_t_A_U_ortho_power = torch.matmul(
+            U_ortho_t_A_U_ortho_power,
+            U_ortho_t_A_U_ortho
+        )
+    chr_poly_val = chr_poly_val.inverse()
+
+    res = _symeig_backward_complete_eigenspace(
+        D_grad, U_grad, A, D, U
+    )
 
     for k in range(1, chr_poly_D.shape[-1]):
         p_res = A.new_zeros(A.shape)
         for i in range(0, k):
-            p_res += U_ortho @ U_ortho_t_A_U_ortho.matrix_power(k - 1 - i) @ q @ U_ortho.t() @ U_grad @ torch.diag_embed(D.pow(i)) @ U.t()
+            p_res += U_ortho @ U_ortho_t_A_U_ortho.matrix_power(k - 1 - i) @ chr_poly_val @ U_ortho.t() @ U_grad @ torch.diag_embed(D.pow(i)) @ U.t()
         res -= chr_poly_D[k] * p_res
 
     return res
