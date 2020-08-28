@@ -13,6 +13,91 @@ from .overrides import has_torch_function, handle_torch_function
 
 __all__ = ['lobpcg', 'lobpcg2']
 
+def _symeig_backward_complete_eigenspace(D_grad, U_grad, A, D, U):
+    # compute F, such that F_ij = (d_j - d_i)^{-1} for i != j, F_ii = 0
+    F = D.unsqueeze(-2) - D.unsqueeze(-1)
+    F.diagonal().fill_(float('inf'))
+    F.pow_(-1)
+
+    # A.grad = U (D.grad + (U^T U.grad * F)) U^T
+    Ut = U.transpose(-1, -2).contiguous()
+    res = torch.matmul(
+        U,
+        torch.matmul(
+            torch.diag_embed(D_grad) + torch.matmul(Ut, U_grad) * F,
+            Ut
+        )
+    )
+
+    return res
+
+
+def _polynomial_coefficients_given_roots(roots):
+    """
+    Given `roots` of a polynomial, find the polynomial's coefficients.
+
+    If roots = {r_1, ..., r_n}, then the method returns
+    coefficients {a_0, a_1, ..., a_n (== 1)} so that
+    p(x) = (x - r_1) * ... * (x - r_n)
+         = x^n + a_{n-1} * x^{n-1} + ... a_1 * x_1 + a_0
+
+    Note: for better performance requires writing a low-level kernel
+    """
+    poly_order = roots.shape[-1]
+    poly_coeffs_shape = list(roots.shape)
+    # we assume p(x) = x^n + a_{n-1} * x^{n-1} + ... + a_1 * x + a_0,
+    # so poly_coeffs = {a_0, ..., a_n, a_{n+1}(== 1)}
+    poly_coeffs_shape[-1] += 1
+    poly_coeffs = roots.new_zeros(poly_coeffs_shape)
+    poly_coeffs[..., -1] = 1
+
+    # perform Horner's rule
+    for i in range(1, poly_order + 1):
+        for j in range(poly_order - i - 1, poly_order):
+            poly_coeffs[..., j] -= roots[..., i - 1] * poly_coeffs[..., j + 1]
+
+    return poly_coeffs
+
+def _symeig_backward_partial_eigenspace(D_grad, U_grad, A, D, U):
+    U_shape = list(U.shape)
+    U_shape[-1] = U_shape[-2]
+    U_to_square = U.new_zeros(U_shape)
+    U_to_square[..., :, :U.shape[-1]] = U
+    U_full_basis, _ = torch.qr(U_to_square)
+    U_ortho = U_full_basis[..., :, -(U.shape[-2] - U.shape[-1]):]
+
+    chr_poly_D = _polynomial_coefficients_given_roots(D)
+
+    res = _symeig_backward_complete_eigenspace(
+        D_grad, U_grad, A, D, U
+    )
+
+    # compute chr_poly_D(U_ortho^T A U_ortho)^{-1})
+    arg = U_ortho.t() @ A @ U_ortho
+    q = arg.new_zeros(arg.shape)
+    for k in range(chr_poly_D.shape[-1]):
+        q += chr_poly_D[k] * arg.matrix_power(k)
+    q = q.inverse()
+
+    for k in range(1, chr_poly_D.shape[-1]):
+        p_res = A.new_zeros(A.shape)
+        for i in range(0, k):
+            p_res += U_ortho @ arg.matrix_power(k - 1 - i) @ q @ U_ortho.t() @ U_grad @ torch.diag_embed(D.pow(i)) @ U.t()
+        res -= chr_poly_D[k] * p_res
+
+    return res
+
+def _symeig_backward(D_grad, U_grad, A, D, U):
+    # if `U` is square, then the columns of `U` is a complete eigenspace
+    if U.size(-1) == U.size(-2):
+        return _symeig_backward_complete_eigenspace(
+            D_grad, U_grad, A, D, U
+        )
+    else:
+        return _symeig_backward_partial_eigenspace(
+            D_grad, U_grad, A, D, U
+        )
+
 class LOBPCGAutogradFunction(torch.autograd.Function):
 
     @staticmethod
@@ -34,7 +119,11 @@ class LOBPCGAutogradFunction(torch.autograd.Function):
                 ):
         # type: (...) -> Tuple[Tensor, Tensor]
 
-        D, U = lobpcg(A, k, B, X, n, iK, niter, tol, largest, method, tracker, ortho_iparams, ortho_fparams, ortho_bparams)
+        D, U = lobpcg(
+            A, k, B, X,
+            n, iK, niter, tol, largest, method, tracker,
+            ortho_iparams, ortho_fparams, ortho_bparams
+        )
         # LOBPCG uses a random eigenspace approximation
         # if parameter `X` is not provided.
         # This may cause a non-deterministic behavior
@@ -52,94 +141,6 @@ class LOBPCGAutogradFunction(torch.autograd.Function):
         return D, U
 
     @staticmethod
-    def _symeig_backward_complete_eigenspace(D_grad, U_grad, A, D, U):
-        # compute F, such that F_ij = (d_j - d_i)^{-1} for i != j, F_ii = 0
-        F = D.unsqueeze(-2) - D.unsqueeze(-1)
-        F.diagonal().fill_(float('inf'))
-        F.pow_(-1)
-
-        # A.grad = U (D.grad + (U^T U.grad * F)) U^T
-        Ut = U.transpose(-1, -2).contiguous()
-        res = torch.matmul(
-            U,
-            torch.matmul(
-                torch.diag_embed(D_grad) + torch.matmul(Ut, U_grad) * F,
-                Ut
-            )
-        )
-
-        return res
-
-    @staticmethod
-    def _polynomial_coefficients_given_roots(roots):
-        """
-        Given `roots` of a polynomial, find the polynomial's coefficients.
-
-        If roots = {r_1, ..., r_n}, then the method returns
-        coefficients {a_0, a_1, ..., a_n (== 1)} so that
-        p(x) = (x - r_1) * ... * (x - r_n)
-             = x^n + a_{n-1} * x^{n-1} + ... a_1 * x_1 + a_0
-
-        Note: for better performance requires writing a low-level kernel
-        """
-        poly_order = roots.shape[-1]
-        poly_coeffs_shape = list(roots.shape)
-        # we assume p(x) = x^n + a_{n-1} * x^{n-1} + ... + a_1 * x + a_0,
-        # so poly_coeffs = {a_0, ..., a_n, a_{n+1}(== 1)}
-        poly_coeffs_shape[-1] += 1
-        poly_coeffs = roots.new_zeros(poly_coeffs_shape)
-        poly_coeffs[..., -1] = 1
-
-        # perform Horner's rule
-        for i in range(1, poly_order + 1):
-            for j in range(poly_order - i - 1, poly_order):
-                poly_coeffs[..., j] -= roots[..., i - 1] * poly_coeffs[..., j + 1]
-
-        return poly_coeffs
-
-    @staticmethod
-    def _symeig_backward_partial_eigenspace(D_grad, U_grad, A, D, U):
-        U_shape = list(U.shape)
-        U_shape[-1] = U_shape[-2]
-        U_to_square = U.new_zeros(U_shape)
-        U_to_square[..., :, :U.shape[-1]] = U
-        U_full_basis, _ = torch.qr(U_to_square)
-        U_ortho = U_full_basis[..., :, -(U.shape[-2] - U.shape[-1]):]
-
-        chr_poly_D = LOBPCGAutogradFunction._polynomial_coefficients_given_roots(D)
-
-        res = LOBPCGAutogradFunction._symeig_backward_complete_eigenspace(
-            D_grad, U_grad, A, D, U
-        )
-
-        # compute chr_poly_D(U_ortho^T A U_ortho)^{-1})
-        arg = U_ortho.t() @ A @ U_ortho
-        q = arg.new_zeros(arg.shape)
-        for k in range(chr_poly_D.shape[-1]):
-            q += chr_poly_D[k] * arg.matrix_power(k)
-        q = q.inverse()
-
-        for k in range(1, chr_poly_D.shape[-1]):
-            p_res = A.new_zeros(A.shape)
-            for i in range(0, k):
-                p_res += U_ortho @ arg.matrix_power(k - 1 - i) @ q @ U_ortho.t() @ U_grad @ torch.diag_embed(D.pow(i)) @ U.t()
-            res -= chr_poly_D[k] * p_res
-
-        return res
-
-    @staticmethod
-    def _symeig_backward(D_grad, U_grad, A, D, U):
-        # if `U` is square, then the columns of `U` is a complete eigenspace
-        if U.size(-1) == U.size(-2):
-            return LOBPCGAutogradFunction._symeig_backward_complete_eigenspace(
-                D_grad, U_grad, A, D, U
-            )
-        else:
-            return LOBPCGAutogradFunction._symeig_backward_partial_eigenspace(
-                D_grad, U_grad, A, D, U
-            )
-
-    @staticmethod
     def backward(ctx, D_grad, U_grad):
         A_grad = B_grad = None
         grads = [None] * 14
@@ -148,7 +149,7 @@ class LOBPCGAutogradFunction(torch.autograd.Function):
 
         # symeig backward
         if B is None:
-            A_grad = LOBPCGAutogradFunction._symeig_backward(
+            A_grad = _symeig_backward(
                 D_grad, U_grad, A, D, U
             )
 
