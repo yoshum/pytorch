@@ -59,13 +59,21 @@ def _polynomial_coefficients_given_roots(roots):
     return poly_coeffs
 
 def _symeig_backward_partial_eigenspace(D_grad, U_grad, A, D, U):
-    U_shape = list(U.shape)
-    U_shape[-1] = U_shape[-2]
-    U_to_square = U.new_zeros(U_shape)
-    U_to_square[..., :, :U.shape[-1]] = U
-    U_full_basis, _ = torch.qr(U_to_square)
-    U_ortho = U_full_basis[..., :, -(U.shape[-2] - U.shape[-1]):]
+    # the block below computes the tensor U_ortho, the columns of which
+    # form an orthonormal complement of the subspace spanned by the
+    # columns of U. We use QR for this task.
+    m = U.shape[-2]
+    k = U.shape[-1]
+    U_with_zero_columns = torch.cat(
+        [U, U.new_zeros(*U.shape[:-2], m, m - k)],
+        axis=-1
+    )
+    U_full_basis, _ = torch.qr(U_with_zero_columns)
+    U_ortho = U_full_basis[..., :, -(m - k):].contiguous()
 
+    # compute the coefficients of the characteristic polynomial of the tensor D.
+    # Note that D is diagonal, so the diagonal elements are exactly the roots
+    # of the characteristic polynomial.
     chr_poly_D = _polynomial_coefficients_given_roots(D)
 
     res = _symeig_backward_complete_eigenspace(
