@@ -59,47 +59,29 @@ def _polynomial_coefficients_given_roots(roots):
     return poly_coeffs
 
 def _symeig_backward_partial_eigenspace(D_grad, U_grad, A, D, U):
-    # the block below computes the tensor U_ortho, the columns of which
-    # form an orthonormal complement of the subspace spanned by the
-    # columns of U. We use QR for this task.
-    m = U.shape[-2]
-    k = U.shape[-1]
-    U_with_zero_columns = torch.cat(
-        [U, U.new_zeros(*U.shape[:-2], m, m - k)],
-        axis=-1
-    )
-    U_full_basis, _ = torch.qr(U_with_zero_columns)
-    U_ortho = U_full_basis[..., :, -(m - k):].contiguous()
-
     # compute the coefficients of the characteristic polynomial of the tensor D.
     # Note that D is diagonal, so the diagonal elements are exactly the roots
     # of the characteristic polynomial.
     chr_poly_D = _polynomial_coefficients_given_roots(D)
 
-    # compute chr_poly_D(U_ortho^T A U_ortho)^{-1})
-    U_ortho_t = U_ortho.transpose(-2, -1).contiguous()
-    U_ortho_t_A_U_ortho = torch.matmul(
-        U_ortho_t,
-        torch.matmul(A, U_ortho)
-    )
-    chr_poly_val = U_ortho_t_A_U_ortho.new_zeros(U_ortho_t_A_U_ortho.shape)
-    U_ortho_t_A_U_ortho_power = U_ortho_t_A_U_ortho.matrix_power(0)
+    chr_poly_A = A.new_zeros(A.shape)
     for k in range(chr_poly_D.shape[-1]):
-        chr_poly_val += chr_poly_D[k] * U_ortho_t_A_U_ortho_power
-        U_ortho_t_A_U_ortho_power = torch.matmul(
-            U_ortho_t_A_U_ortho_power,
-            U_ortho_t_A_U_ortho
-        )
-    chr_poly_val = chr_poly_val.inverse()
+        chr_poly_A += chr_poly_D[k] * A.matrix_power(k)
 
     res = _symeig_backward_complete_eigenspace(
         D_grad, U_grad, A, D, U
     )
 
+    proj_U_ortho = -U @ U.t()
+    proj_U_ortho.diagonal().add_(1)
+    x, _ = torch.solve(proj_U_ortho, chr_poly_A)
+    x = proj_U_ortho @ x
+
+    p_res = A.new_zeros(A.shape)
     for k in range(1, chr_poly_D.shape[-1]):
-        p_res = A.new_zeros(A.shape)
+        p_res.zero_()
         for i in range(0, k):
-            p_res += U_ortho @ U_ortho_t_A_U_ortho.matrix_power(k - 1 - i) @ chr_poly_val @ U_ortho.t() @ U_grad @ torch.diag_embed(D.pow(i)) @ U.t()
+            p_res += A.matrix_power(k - 1 - i) @ x @ U_grad @ torch.diag_embed(D.pow(i)) @ U.t()
         res -= chr_poly_D[k] * p_res
 
     return res
@@ -136,11 +118,14 @@ class LOBPCGAutogradFunction(torch.autograd.Function):
                 ):
         # type: (...) -> Tuple[Tensor, Tensor]
 
-        D, U = lobpcg(
-            A, k, B, X,
-            n, iK, niter, tol, largest, method, tracker,
-            ortho_iparams, ortho_fparams, ortho_bparams
-        )
+        #D, U = lobpcg(
+        #    A, k, B, X,
+        #    n, iK, niter, tol, largest, method, tracker,
+        #    ortho_iparams, ortho_fparams, ortho_bparams
+        #)
+        D, U = torch.symeig(A, eigenvectors=True, upper=True)
+        D = D[..., -k:]
+        U = U[..., :, -k:]
         # LOBPCG uses a random eigenspace approximation
         # if parameter `X` is not provided.
         # This may cause a non-deterministic behavior
