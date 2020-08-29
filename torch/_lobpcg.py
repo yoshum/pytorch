@@ -77,12 +77,12 @@ def _symeig_backward_partial_eigenspace(D_grad, U_grad, A, D, U):
     x, _ = torch.solve(proj_U_ortho, chr_poly_A)
     x = proj_U_ortho @ x
 
-    p_res = A.new_zeros(A.shape)
+    p_res = A.new_zeros(*A.shape[:-1], D.shape[-1])
     for k in range(1, chr_poly_D.shape[-1]):
         p_res.zero_()
         for i in range(0, k):
-            p_res += A.matrix_power(k - 1 - i) @ x @ U_grad @ torch.diag_embed(D.pow(i)) @ U.t()
-        res -= chr_poly_D[k] * p_res
+            p_res += A.matrix_power(k - 1 - i) @ (U_grad * D.pow(i).unsqueeze(-2))
+        res -= chr_poly_D[k] * (x @  p_res @ U.t())
 
     return res
 
