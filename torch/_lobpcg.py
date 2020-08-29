@@ -81,7 +81,7 @@ def _symeig_backward_partial_eigenspace(D_grad, U_grad, A, D, U):
     for k in range(1, chr_poly_D.shape[-1]):
         p_res.zero_()
         for i in range(0, k):
-            p_res += A.matrix_power(k - 1 - i) @ (U_grad * D.pow(i).unsqueeze(-2))
+            p_res += (A.matrix_power(k - 1 - i) @ U_grad) * D.pow(i).unsqueeze(-2)
         res -= chr_poly_D[k] * (x @  p_res @ U.t())
 
     return res
