@@ -11,6 +11,7 @@ from ..quantization_mappings import (
 from torch.fx import (
     GraphModule,
     Proxy,
+    symbolic_trace,
 )
 
 from torch.fx.graph import (
@@ -24,6 +25,8 @@ from .pattern_utils import (
     get_quant_patterns,
     get_dynamic_quant_patterns,
 )
+
+from .custom_module import is_custom_module
 
 from .quantization_patterns import *
 
@@ -198,6 +201,22 @@ class Quantizer:
         quants = self._find_quants(input_graph, matches)
 
         self.activation_post_process_map = dict()
+
+        # swap custom modules to observed custom modules
+        for node in input_graph.nodes:
+            if node.op == 'call_module' and \
+               is_custom_module(self.modules[node.target]):
+                custom_module = self.modules[node.target]
+                traced_custom_module = symbolic_trace(custom_module)
+                custom_module_qconfig = self.qconfig_map[node.name]
+                if self.is_dynamic_quant:
+                    prepare = torch.quantization.prepare_dynamic_fx
+                else:
+                    prepare = torch.quantization.prepare_fx
+                observed_custom_module = prepare(traced_custom_module, {'': custom_module_qconfig})
+                self.modules[node.target] = observed_custom_module
+                # 2. add node to matched nodes
+                matches[node.name] = (node, [node], CustomModule(self, node), custom_module_qconfig)
 
         env = {}
         observed_graph = Graph()
