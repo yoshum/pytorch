@@ -6,24 +6,9 @@ import torch.nn.quantized as nnq
 import torch.nn.quantized.dynamic as nnqd
 from torch.quantization import prepare
 
-from .default_mappings import (
-    _EXCLUDE_QCONFIG_PROPAGATE_LIST,
-    _INCLUDE_QCONFIG_PROPAGATE_LIST,
-    DEFAULT_DYNAMIC_MODULE_MAPPING,
-    DEFAULT_MODULE_MAPPING,
-    DEFAULT_QAT_MODULE_MAPPING,
+from .quantization_mappings import (
+    get_compare_output_module_list,
 )
-
-
-DEFAULT_NUMERIC_SUITE_COMPARE_MODEL_OUTPUT_WHITE_LIST = (
-    set(DEFAULT_MODULE_MAPPING.values())
-    | set(DEFAULT_QAT_MODULE_MAPPING.values())
-    | set(DEFAULT_DYNAMIC_MODULE_MAPPING.values())
-    | set(DEFAULT_MODULE_MAPPING.keys())
-    | set(DEFAULT_QAT_MODULE_MAPPING.keys())
-    | set(DEFAULT_DYNAMIC_MODULE_MAPPING.keys())
-    | _INCLUDE_QCONFIG_PROPAGATE_LIST
-) - _EXCLUDE_QCONFIG_PROPAGATE_LIST
 
 NON_LEAF_MODULE_TO_ADD_OBSERVER_WHITE_LIST = {
     nnqd.Linear,
@@ -409,8 +394,7 @@ def prepare_model_outputs(
     float_module,
     q_module,
     Logger=OutputLogger,
-    white_list=DEFAULT_NUMERIC_SUITE_COMPARE_MODEL_OUTPUT_WHITE_LIST,
-):
+    white_list=None):
     r"""Prepare the model by attaching the logger to both float module
     and quantized module if they are in the white_list.
 
@@ -420,6 +404,10 @@ def prepare_model_outputs(
         Logger: type of logger to be attached to float_module and q_module
         white_list: list of module types to attach logger
     """
+    compare_output_module_list = white_list
+    if compare_output_module_list:
+        compare_output_module_list = get_compare_output_module_list()
+
     qconfig_debug = torch.quantization.QConfig(activation=Logger, weight=None)
     float_module.qconfig = qconfig_debug
     prepare(float_module, inplace=True, white_list=white_list)
@@ -427,7 +415,7 @@ def prepare_model_outputs(
     prepare(
         q_module,
         inplace=True,
-        white_list=white_list,
+        white_list=compare_output_module_list,
         observer_non_leaf_module_list=NON_LEAF_MODULE_TO_ADD_OBSERVER_WHITE_LIST,
     )
 
@@ -437,7 +425,7 @@ def compare_model_outputs(
     q_model,
     *data,
     Logger=OutputLogger,
-    white_list=DEFAULT_NUMERIC_SUITE_COMPARE_MODEL_OUTPUT_WHITE_LIST,
+    white_list=None
 ):
     r"""Compare output activations between float and quantized models at
     corresponding locations for the same input. Return a dict with key corresponding
@@ -463,7 +451,11 @@ def compare_model_outputs(
         and each entry being a dictionary with two keys 'float' and 'quantized',
         containing the matching float and quantized activations
     """
-    prepare_model_outputs(float_model, q_model, Logger, white_list)
+    compare_output_module_list = white_list
+    if compare_output_module_list:
+        compare_output_module_list = get_compare_output_module_list()
+
+    prepare_model_outputs(float_model, q_model, Logger, compare_output_module_list)
     float_model(*data)
     q_model(*data)
     act_compare_dict = get_matching_activations(float_model, q_model)
